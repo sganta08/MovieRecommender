@@ -39,6 +39,8 @@ def get_user_diary(username):
         released_dates = soup.find_all(class_='td-released center')
         ratings = soup.find_all('span', class_='rating')
 
+        film_slug_list = []
+
         for j in range(len(films)): 
             if month_watched:
                 current_month = month_watched[j].get_text(strip=True) if month_watched[j].get_text(strip=True) else current_month
@@ -53,10 +55,12 @@ def get_user_diary(username):
             #replace all non-alphanumeric characters with empty string aside from hyphens
             film_slug = re.sub(r'[^a-zA-Z0-9-]', '', film_slug)
             #remove duplicate hyphens like '--'
+            keep_film_slug = re.sub(r'-+', '-', film_slug)
+            film_slug_list.append(keep_film_slug)
+
             film_slug = re.sub(r'-+', '-', film_slug)
             #remove hyphens at the beginning or end of the string
             film_slug = film_slug.strip('-')
-            print(film_slug)
             
             # fetching genres using the name of the film
             genre_url = f'https://letterboxd.com/film/{film_slug}/genres/'
@@ -82,7 +86,7 @@ def get_user_diary(username):
             all_data.append(data)
             
     df = pd.DataFrame(all_data)
-    return df
+    return df, film_slug_list
 
 def clean_diary_data(df):
    # Function implementation here
