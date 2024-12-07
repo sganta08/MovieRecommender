@@ -4,85 +4,10 @@ import pandas as pd
 import re
 import unicodedata
 import numpy as np
-
-def get_user_diary(username):
-    """Creates a DataFrame of a user's Letterboxd diary given their username
-
-    Args: 
-        username (string): Letterboxd username
-
-    Returns:
-        df (DataFrame): DataFrame containing the information in a user's diary (movies, ratings, etc.)
-    """
-
-    # Finding the max page number
-    url = f'https://letterboxd.com/{username}/films/diary/'
-    html = requests.get(url).text
-    soup = BeautifulSoup(html, 'html.parser')
-    pagination = soup.find('div', class_='pagination')
-    if pagination:
-        max_page = int(pagination.find_all('li', class_='paginate-page')[-1].text) 
-    else:
-        max_page = 1
-
-    all_data = [] 
-    current_month = None 
-
-    for i in range(1, max_page + 1):
-        url = f'https://letterboxd.com/{username}/films/diary/page/{i}'
-        html = requests.get(url).text
-        soup = BeautifulSoup(html, 'html.parser')
-
-        month_watched = soup.find_all(class_='td-calendar')
-        day_watched = soup.find_all(class_='td-day diary-day center')
-        films = soup.find_all('h3', class_='headline-3 prettify')
-        released_dates = soup.find_all(class_='td-released center')
-        ratings = soup.find_all('span', class_='rating')
-
-        for j in range(len(films)): 
-            if month_watched:
-                current_month = month_watched[j].get_text(strip=True) if month_watched[j].get_text(strip=True) else current_month
-            
-            # getting film title for genre lookup
-            film_title = films[j].get_text(strip=True)
-            film_slug = '-'.join(re.sub(r'\s*:\s*', '-', film_title).lower().split())
-
-            # Convert non-ASCII characters to ASCII equivalents
-            film_slug = unicodedata.normalize('NFKD', film_slug).encode('ascii', 'ignore').decode('ascii')
-            film_slug = film_slug.replace('.', '') 
-            #replace all non-alphanumeric characters with empty string aside from hyphens
-            film_slug = re.sub(r'[^a-zA-Z0-9-]', '', film_slug)
-            #remove duplicate hyphens like '--'
-            film_slug = re.sub(r'-+', '-', film_slug)
-            #remove hyphens at the beginning or end of the string
-            film_slug = film_slug.strip('-')
-            print(film_slug)
-            
-            # fetching genres using the name of the film
-            genre_url = f'https://letterboxd.com/film/{film_slug}/genres/'
-            genre_html = requests.get(genre_url).text
-            genre_soup = BeautifulSoup(genre_html, 'html.parser')
-            genres = genre_soup.find('div', class_='text-sluglist capitalize')
-            
-            if genres:
-                genre_list = [genre.text for genre in genres.find_all('a', class_='text-slug')]
-                genres_str = ', '.join(genre_list) # joining the genres with commas
-                
-            else:
-                genres_str = None
-            
-            data = {
-                'Month': current_month,
-                'Day': day_watched[j].get_text(strip=True) if j < len(day_watched) else None,
-                'Film': film_title,
-                'Released': released_dates[j].get_text(strip=True) if j < len(released_dates) else None,
-                'Ratings': ratings[j].get_text(strip=True) if j < len(ratings) else None,
-                'Genres': genres_str 
-            }
-            all_data.append(data)
-            
-    df = pd.DataFrame(all_data)
-    return df
+import time
+from typing import List, Dict, Optional
+from tqdm import tqdm
+from datetime import datetime
 
 def clean_diary_data(df):
    # Function implementation here
@@ -161,3 +86,138 @@ def accuracy_within_half_star(y_true, y_pred):
     within_range = np.abs(y_true - y_pred) <= 0.5
     accuracy = np.mean(within_range)  # Calculate percentage of True values
     return accuracy
+
+def search_movie(title: str, year: Optional[int], api_key: str) -> Optional[Dict]:
+    """
+    Search for a movie by title and optionally year.
+    
+    Args:
+        title: Movie title to search for
+        year: Optional release year to help match the correct movie
+        api_key: TMDB API key
+        
+    Returns:
+        Dict containing movie search result or None if not found
+    """
+    base_url = "https://api.themoviedb.org/3"
+    url = f"{base_url}/search/movie"
+    params = {
+        'api_key': api_key,
+        'query': title,
+        'language': 'en-US',
+        'include_adult': 'true'  # Include all movies to ensure we find the right one even if adult
+    }
+    
+    try:
+        response = requests.get(url, params=params)
+        response.raise_for_status()
+        results = response.json().get('results', [])
+        
+        if not results:
+            return None
+            
+        if year:
+            # Try to find exact year match first
+            for result in results:
+                release_date = result.get('release_date', '')
+                if release_date and int(release_date[:4]) == year:
+                    return result
+                    
+        return results[0]
+        
+    except Exception as e:
+        print(f"Error searching for {title}: {str(e)}")
+        return None
+
+def get_movie_details(movie_id: int, api_key: str) -> Optional[Dict]:
+    """
+    Get detailed information about a movie.
+    
+    Args:
+        movie_id: TMDB movie ID
+        api_key: TMDB API key
+        
+    Returns:
+        Dict containing detailed movie information or None if not found
+    """
+    base_url = "https://api.themoviedb.org/3"
+    url = f"{base_url}/movie/{movie_id}"
+    params = {
+        'api_key': api_key,
+        'language': 'en-US',
+        'append_to_response': 'credits,keywords,external_ids'
+    }
+    
+    try:
+        response = requests.get(url, params=params)
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        print(f"Error getting details for movie {movie_id}: {str(e)}")
+        return None
+
+def get_movie_data(details: Dict, original_title: str) -> Dict:
+    """Extract only the most relevant features for prediction."""
+    return {
+        'Original Title': original_title,
+        'TMDB ID': details.get('id'),
+        'IMDb ID': details.get('external_ids', {}).get('imdb_id'),
+        'Budget': details.get('budget', 0),
+        'Revenue': details.get('revenue', 0),
+        'TMDB Rating': details.get('vote_average'),
+        'TMDB Vote Count': details.get('vote_count'),
+        'Popularity': details.get('popularity'),
+        'Genres': ', '.join(g['name'] for g in details.get('genres', [])),
+        'Adult': details.get('adult', False)
+    }
+
+def get_tmdb_data(movies_df: pd.DataFrame, api_key: str, delay: float = 0.25) -> pd.DataFrame:
+    """Get streamlined TMDB data for movies."""
+    all_data = []
+    
+    for _, row in tqdm(movies_df.iterrows(), total=len(movies_df), desc="Fetching TMDB data"):
+        title = row['Film']
+        year = int(row['Released']) if 'Released' in movies_df.columns else None
+        
+        search_result = search_movie(title, year, api_key)
+        if not search_result:
+            print(f"Could not find movie: {title}")
+            continue
+            
+        time.sleep(delay)
+        
+        details = get_movie_details(search_result['id'], api_key)
+        if not details:
+            continue
+            
+        time.sleep(delay)
+        movie_data = get_movie_data(details, title)
+        all_data.append(movie_data)
+    
+    return pd.DataFrame(all_data)
+
+def fetch_imdb_ratings(tmdb_data):
+    """
+    Fetches IMDb ratings using the IMDb dataset.
+    Note: You'll need to download the IMDb ratings dataset first.
+    """
+    import gzip
+    import csv
+    
+    imdb_ratings = {}
+    with gzip.open('title.ratings.tsv.gz', 'rt') as f:
+        reader = csv.DictReader(f, delimiter='\t')
+        for row in reader:
+            imdb_ratings[row['tconst']] = {
+                'rating': float(row['averageRating']),
+                'votes': int(row['numVotes'])
+            }
+    
+    ratings = []
+    for imdb_id in tmdb_data['IMDb ID']:
+        if imdb_id in imdb_ratings:
+            ratings.append(imdb_ratings[imdb_id]['rating'])
+        else:
+            ratings.append(None)
+            
+    return ratings
