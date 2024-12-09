@@ -6,20 +6,19 @@ import unicodedata
 import numpy as np
 import time
 from typing import List, Dict, Optional
-from tqdm import tqdm
-from datetime import datetime
+from datetime import datetime, timedelta
+from sklearn.preprocessing import LabelEncoder
+import requests
+import gzip
+import csv
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
+import matplotlib.pyplot as plt
+
 
 def clean_diary_data(df):
-   # Function implementation here
-    """Cleans the DataFrame containing Letterboxd diary data.
-
-    Args:
-        df (DataFrame): DataFrame from get_user_diary function.
-
-    Returns:
-        df (DataFrame): Cleaned DataFrame.
-    """
-
     # extracting month and year into separate columns
     df[['Month', 'Year']] = df['Month'].str.extract('([a-zA-Z]+)(\d{4})')
     month_mapping = {
@@ -42,63 +41,177 @@ def clean_diary_data(df):
     return df
 
 def remove_duplicate_movies(df):
-    # Function implementation here
-    """Removes duplicate movie entries from the DataFrame.
-
-    Args:
-        df (DataFrame): DataFrame with movie entries.
-
-    Returns:
-        df (DataFrame): DataFrame with duplicate movie entries removed. 
-    """
     # Remove duplicates based on 'Film', 'Year', 'Month', and 'Day'
     df = df.drop_duplicates(subset=['Film', 'Year', 'Month', 'Day'], keep='first') 
     return df
 
-def linear_regression_numpy(X, y, alpha=0.01):
-    """
-    Performs linear regression using NumPy.
+def get_random_movies_for_prediction(api_key, num_movies=100, used_titles=None):
+    """Get random movies from TMDB that have IMDb ratings in our dataset."""
+    base_url = "https://api.themoviedb.org/3"
+    movies = []
+    page = 1
+    max_pages = 50
+    used_titles = set() if used_titles is None else set(used_titles)
 
-    Args:
-        X (NumPy array): Feature matrix (n_samples x n_features).
-        y (NumPy array): Target variable (n_samples).
+    # Load IMDb ratings
+    imdb_ratings = {}
+    print("Loading IMDb ratings...")
+    with gzip.open('title.ratings.tsv.gz', 'rt') as f:
+        reader = csv.DictReader(f, delimiter='\t')
+        for row in reader:
+            imdb_ratings[row['tconst']] = float(row['averageRating'])
+    
+    print("Fetching movies...")
+    while len(movies) < num_movies and page <= max_pages:
+        params = {
+            'api_key': api_key,
+            'language': 'en-US',
+            'sort_by': 'vote_count.desc',
+            'page': page,
+            'include_adult': 'false'
+        }
+        
+        try:
+            response = requests.get(f"{base_url}/discover/movie", params=params)
+            data = response.json()
+            
+            for movie in data['results']:
+                if len(movies) >= num_movies:
+                    break
+                    
+                if movie['title'] in used_titles:
+                    continue
+                
+                # Get detailed movie info
+                movie_url = f"{base_url}/movie/{movie['id']}"
+                movie_params = {
+                    'api_key': api_key,
+                    'append_to_response': 'external_ids'
+                }
+                movie_response = requests.get(movie_url, params=movie_params)
+                movie_details = movie_response.json()
+                
+                # Get IMDb ID and rating
+                imdb_id = movie_details.get('external_ids', {}).get('imdb_id')
+                if imdb_id and imdb_id in imdb_ratings:
+                    movies.append({
+                        'Title': movie['title'],
+                        'TMDB Rating': movie['vote_average'],
+                        'TMDB Vote Count': movie['vote_count'],
+                        'Popularity': movie['popularity'],
+                        'Budget': movie_details.get('budget', 0),
+                        'Revenue': movie_details.get('revenue', 0),
+                        'Genres': ', '.join(g['name'] for g in movie_details.get('genres', [])),
+                        'IMDb Rating': imdb_ratings[imdb_id]
+                    })
+                    used_titles.add(movie['title'])
+                    print(f"Found {len(movies)}/{num_movies} movies", end='\r')
+                
+                time.sleep(0.25)
+                
+            page += 1
+            
+        except Exception as e:
+            print(f"\nError on page {page}: {str(e)}")
+            continue
+    return pd.DataFrame(movies)
 
-    Returns:
-        tuple: A tuple containing the model coefficients (weights) and the intercept.
-    """
+def get_movie_recommendations(api_key, trained_model, scaler, used_titles, num_movies=100):
+    # Get random movies
+    print("Fetching random movies...")
+    random_movies = get_random_movies_for_prediction(api_key, num_movies, used_titles=used_titles)
+    
+    if random_movies.empty:
+        print("No movies found!")
+        return pd.DataFrame()
+    
+    # Process features using our existing function
+    processed_data, _ = engineer_features_for_knn(random_movies)
+    
+    # predictions
+    predictions = trained_model.predict(processed_data)
+    
+    random_movies['Predicted_Rating'] = predictions
+    
+    # Sort and filter recs
+    recommendations = random_movies.sort_values('Predicted_Rating', ascending=False)
+    loves = recommendations[recommendations['Predicted_Rating'] >= 4.0]
+    
+    return loves[['Title', 'Predicted_Rating', 'TMDB Rating', 'IMDb Rating']]
 
-    # Add a bias term (intercept) to the feature matrix
-    X_b = np.c_[np.ones((X.shape[0], 1)), X]
-    identity = np.eye(X_b.shape[1])  # Create an identity matrix
-    w = np.linalg.inv(X_b.T @ X_b + alpha * identity) @ X_b.T @ y  # Regularization
-    intercept = w[0]
-    weights = w[1:]
-    return weights, intercept
+def engineer_features_for_knn(df):
+    data = df.copy()
+    
+    # Keeping core features plus budget/revenue
+    core_features = [
+        'TMDB Rating',
+        'IMDb Rating',
+        'TMDB Vote Count',
+        'Popularity',
+        'Budget',
+        'Revenue'
+    ]
+    
+    # Filling missing budget/revenue with medians
+    data['Budget'] = data['Budget'].fillna(data['Budget'].median())
+    data['Revenue'] = data['Revenue'].fillna(data['Revenue'].median())
+    
+    data['Rating_Avg'] = (data['TMDB Rating'] + data['IMDb Rating']) / 2
+    data['ROI'] = (data['Revenue'] - data['Budget']) / data['Budget'].where(data['Budget'] > 0, 1)
+    
+    # Create simplified genre features (main genres only)
+    main_genres = ['Action', 'Drama', 'Comedy', 'Horror', 'Romance']
+    for genre in main_genres:
+        data[f'Genre_{genre}'] = data['Genres'].fillna('').str.contains(genre).astype(int)
+    
+    # Final feature list
+    features_to_keep = (core_features + 
+                       ['Rating_Avg', 'ROI'] + 
+                       [f'Genre_{g}' for g in main_genres])
+    
+    data = data[features_to_keep]
+    
+    # Scale
+    scaler = StandardScaler()
+    scaled_data = scaler.fit_transform(data)
+    data = pd.DataFrame(scaled_data, columns=data.columns)
+    
+    return data, scaler
 
-def predict_linear_regression(X, weights, intercept):
-    """Makes predictions using the learned weights and intercept."""
-    X_b = np.c_[np.ones((X.shape[0], 1)), X]  # Add bias term for prediction as well
-    y_pred = X_b @ np.concatenate(([intercept], weights))  # Use weights to predict
-    return y_pred
+def train_and_evaluate_knn(X, y, n_neighbors=15):
+    """Train and evaluate KNN model."""
+    # Split data
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    
+    knn = KNeighborsRegressor(
+        n_neighbors=n_neighbors,
+        weights='distance',
+        metric='manhattan'
+    )
+    knn.fit(X_train, y_train)
+    
+    # predictions
+    y_test_pred = knn.predict(X_test)
+    
+    # basic metrics
+    mse = mean_squared_error(y_test, y_test_pred)
+    r2 = r2_score(y_test, y_test_pred)
+    acc_within_half = np.mean(np.abs(y_test - y_test_pred) <= 0.5)
+    acc_within_one = np.mean(np.abs(y_test - y_test_pred) <= 1.0)
+    
+    print(f"MSE: {mse:.3f}")
+    print(f"R squared: {r2:.3f}")
+    print(f"Accuracy (plus minus 0.5 stars): {acc_within_half:.3f}")
+    print(f"Accuracy (plus minus 1 star): {acc_within_one:.3f}")
+    
+    return knn
 
 def accuracy_within_half_star(y_true, y_pred):
-    """Calculates the accuracy within ± 0.5 stars."""
     within_range = np.abs(y_true - y_pred) <= 0.5
     accuracy = np.mean(within_range)  # Calculate percentage of True values
     return accuracy
 
-def search_movie(title: str, year: Optional[int], api_key: str) -> Optional[Dict]:
-    """
-    Search for a movie by title and optionally year.
-    
-    Args:
-        title: Movie title to search for
-        year: Optional release year to help match the correct movie
-        api_key: TMDB API key
-        
-    Returns:
-        Dict containing movie search result or None if not found
-    """
+def search_movie(title, year, api_key):
     base_url = "https://api.themoviedb.org/3"
     url = f"{base_url}/search/movie"
     params = {
@@ -129,17 +242,7 @@ def search_movie(title: str, year: Optional[int], api_key: str) -> Optional[Dict
         print(f"Error searching for {title}: {str(e)}")
         return None
 
-def get_movie_details(movie_id: int, api_key: str) -> Optional[Dict]:
-    """
-    Get detailed information about a movie.
-    
-    Args:
-        movie_id: TMDB movie ID
-        api_key: TMDB API key
-        
-    Returns:
-        Dict containing detailed movie information or None if not found
-    """
+def get_movie_details(movie_id, api_key):
     base_url = "https://api.themoviedb.org/3"
     url = f"{base_url}/movie/{movie_id}"
     params = {
@@ -156,10 +259,10 @@ def get_movie_details(movie_id: int, api_key: str) -> Optional[Dict]:
         print(f"Error getting details for movie {movie_id}: {str(e)}")
         return None
 
-def get_movie_data(details: Dict, original_title: str) -> Dict:
+def get_movie_data(details, title):
     """Extract only the most relevant features for prediction."""
     return {
-        'Original Title': original_title,
+        'Original Title': title,
         'TMDB ID': details.get('id'),
         'IMDb ID': details.get('external_ids', {}).get('imdb_id'),
         'Budget': details.get('budget', 0),
@@ -171,17 +274,19 @@ def get_movie_data(details: Dict, original_title: str) -> Dict:
         'Adult': details.get('adult', False)
     }
 
-def get_tmdb_data(movies_df: pd.DataFrame, api_key: str, delay: float = 0.25) -> pd.DataFrame:
-    """Get streamlined TMDB data for movies."""
+def get_tmdb_data(movies_df, api_key, delay=0.25):
     all_data = []
+    total_movies = len(movies_df)
     
-    for _, row in tqdm(movies_df.iterrows(), total=len(movies_df), desc="Fetching TMDB data"):
+    for idx, (_, row) in enumerate(movies_df.iterrows(), 1):
         title = row['Film']
         year = int(row['Released']) if 'Released' in movies_df.columns else None
         
+        print(f"Processing {idx}/{total_movies}", end='\r')
+        
         search_result = search_movie(title, year, api_key)
         if not search_result:
-            print(f"Could not find movie: {title}")
+            print(f"\nCould not find movie: {title}")
             continue
             
         time.sleep(delay)
@@ -193,17 +298,13 @@ def get_tmdb_data(movies_df: pd.DataFrame, api_key: str, delay: float = 0.25) ->
         time.sleep(delay)
         movie_data = get_movie_data(details, title)
         all_data.append(movie_data)
-    
     return pd.DataFrame(all_data)
 
 def fetch_imdb_ratings(tmdb_data):
     """
     Fetches IMDb ratings using the IMDb dataset.
-    Note: You'll need to download the IMDb ratings dataset first.
+    Note: As I mention in the notebook files, we need to download the IMDb ratings dataset first.
     """
-    import gzip
-    import csv
-    
     imdb_ratings = {}
     with gzip.open('title.ratings.tsv.gz', 'rt') as f:
         reader = csv.DictReader(f, delimiter='\t')
@@ -221,3 +322,127 @@ def fetch_imdb_ratings(tmdb_data):
             ratings.append(None)
             
     return ratings
+
+def get_user_diary(username):
+    """Creates a DataFrame of a user's Letterboxd diary given their username
+
+    Args: 
+        username (string): Letterboxd username
+
+    Returns:
+        df (DataFrame): DataFrame containing the information in a user's diary (movies, ratings, etc.)
+    """
+
+    # Finding the max page number
+    url = f'https://letterboxd.com/{username}/films/diary/'
+    html = requests.get(url).text
+    soup = BeautifulSoup(html, 'html.parser')
+    pagination = soup.find('div', class_='pagination')
+    if pagination:
+        max_page = int(pagination.find_all('li', class_='paginate-page')[-1].text) 
+    else:
+        max_page = 1
+
+    all_data = [] 
+    current_month = None 
+
+    film_slug_list = []
+
+    for i in range(1, max_page + 1):
+        url = f'https://letterboxd.com/{username}/films/diary/page/{i}'
+        html = requests.get(url).text
+        soup = BeautifulSoup(html, 'html.parser')
+
+        month_watched = soup.find_all(class_='td-calendar')
+        day_watched = soup.find_all(class_='td-day diary-day center')
+        films = soup.find_all('h3', class_='headline-3 prettify')
+        released_dates = soup.find_all(class_='td-released center')
+        ratings = soup.find_all('span', class_='rating')
+
+        for j in range(len(films)): 
+            if month_watched:
+                current_month = month_watched[j].get_text(strip=True) if month_watched[j].get_text(strip=True) else current_month
+            
+            # getting film title for genre lookup
+            film_title = films[j].get_text(strip=True)
+            film_link = films[j].find('a')['href']  # Get the href attribute
+            # Extract the slug from the href (format is "/username/film/film-slug/")
+            film_slug = film_link.split('/')[3]  # Get the fourth element after splitting
+                
+            film_slug_list.append(film_slug)
+            
+            # fetching genres using the name of the film
+            genre_url = f'https://letterboxd.com/film/{film_slug}/genres/'
+            genre_html = requests.get(genre_url).text
+            genre_soup = BeautifulSoup(genre_html, 'html.parser')
+            genres = genre_soup.find('div', class_='text-sluglist capitalize')
+            
+            if genres:
+                genre_list = [genre.text for genre in genres.find_all('a', class_='text-slug')]
+                genres_str = ', '.join(genre_list) # joining the genres with commas
+                
+            else:
+                genres_str = None
+            
+            data = {
+                'Month': current_month,
+                'Day': day_watched[j].get_text(strip=True) if j < len(day_watched) else None,
+                'Film': film_title,
+                'Released': released_dates[j].get_text(strip=True) if j < len(released_dates) else None,
+                'Ratings': ratings[j].get_text(strip=True) if j < len(ratings) else None,
+                'Genres': genres_str 
+            }
+            all_data.append(data)
+            
+    df = pd.DataFrame(all_data)
+    return df, film_slug_list
+
+def plot_model_analysis(model, X, y):
+    """Create key visualization plots."""
+    # Split data for val
+    X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
+    
+    # Plot 1 is Predicted vs Actual ratings
+    plt.figure(figsize=(15, 5))
+    
+    plt.subplot(1, 3, 1)
+    y_pred = model.predict(X_val)
+    plt.scatter(y_val, y_pred, alpha=0.5)
+    plt.plot([y_val.min(), y_val.max()], [y_val.min(), y_val.max()], 'r--')
+    plt.xlabel('Actual Rating')
+    plt.ylabel('Predicted Rating')
+    plt.title('Predicted vs Actual Ratings')
+    
+    # Plot 2 is for the error Error Distribution
+    plt.subplot(1, 3, 2)
+    errors = y_val - y_pred
+    plt.hist(errors, bins=20, edgecolor='black')
+    plt.axvline(x=0, color='r', linestyle='--')
+    plt.xlabel('Prediction Error')
+    plt.ylabel('Count')
+    plt.title('Error Distribution')
+    
+    # Plot 3 is Accuracy by rating ranges
+    plt.subplot(1, 3, 3)
+    accuracy_by_range = []
+    rating_ranges = [(1,2), (2,3), (3,4), (4,5)]
+    
+    for low, high in rating_ranges:
+        mask = (y_val >= low) & (y_val < high)
+        if mask.any():
+            acc = np.mean(np.abs(y_val[mask] - y_pred[mask]) <= 0.5)
+            accuracy_by_range.append(acc)
+    
+    plt.bar([f"{l}-{h}" for l,h in rating_ranges], accuracy_by_range)
+    plt.xlabel('Rating Range')
+    plt.ylabel('Accuracy (plus minus 0.5)')
+    plt.title('Accuracy by Rating Range')
+    
+    plt.tight_layout()
+    plt.show()
+    
+    return {
+        'overall_accuracy': np.mean(np.abs(y_val - y_pred) <= 0.5),
+        'mse': mean_squared_error(y_val, y_pred),
+        'accuracy_by_range': dict(zip([f"{l}-{h}" for l,h in rating_ranges], accuracy_by_range))
+    }
