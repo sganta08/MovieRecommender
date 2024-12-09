@@ -12,7 +12,6 @@ from sklearn.neighbors import KNeighborsRegressor
 from sklearn.metrics import mean_squared_error, r2_score
 import matplotlib.pyplot as plt
 
-
 def clean_diary_data(df):
     # extracting month and year into separate columns
     df[['Month', 'Year']] = df['Month'].str.extract('([a-zA-Z]+)(\d{4})')
@@ -435,3 +434,28 @@ def plot_model_analysis(model, X, y):
     
     plt.tight_layout()
     plt.show()
+    
+def linear_regression_numpy(X, y, alpha=0.01):
+    """
+    Performs linear regression using NumPy.
+
+    Args:
+        X (NumPy array): Feature matrix (n_samples x n_features).
+        y (NumPy array): Target variable (n_samples).
+
+    Returns:
+        tuple: A tuple containing the model coefficients (weights) and the intercept.
+    """
+    # Add a bias term (intercept) to the feature matrix
+    X_b = np.c_[np.ones((X.shape[0], 1)), X]
+    identity = np.eye(X_b.shape[1])  # Create an identity matrix
+    w = np.linalg.inv(X_b.T @ X_b + alpha * identity) @ X_b.T @ y  # Regularization
+    intercept = w[0]
+    weights = w[1:]
+    return weights, intercept
+
+def predict_linear_regression(X, weights, intercept):
+    """Makes predictions using the learned weights and intercept."""
+    X_b = np.c_[np.ones((X.shape[0], 1)), X]  # Add bias term for prediction as well
+    y_pred = X_b @ np.concatenate(([intercept], weights))  # Use weights to predict
+    return y_pred
