@@ -1,20 +1,15 @@
 import requests
 from bs4 import BeautifulSoup
 import pandas as pd
-import re
-import unicodedata
 import numpy as np
 import time
-from typing import List, Dict, Optional
-from datetime import datetime, timedelta
-from sklearn.preprocessing import LabelEncoder
 import requests
 import gzip
 import csv
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from sklearn.preprocessing import StandardScaler
 from sklearn.neighbors import KNeighborsRegressor
-from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
+from sklearn.metrics import mean_squared_error, r2_score
 import matplotlib.pyplot as plt
 
 
@@ -440,9 +435,3 @@ def plot_model_analysis(model, X, y):
     
     plt.tight_layout()
     plt.show()
-    
-    return {
-        'overall_accuracy': np.mean(np.abs(y_val - y_pred) <= 0.5),
-        'mse': mean_squared_error(y_val, y_pred),
-        'accuracy_by_range': dict(zip([f"{l}-{h}" for l,h in rating_ranges], accuracy_by_range))
-    }
